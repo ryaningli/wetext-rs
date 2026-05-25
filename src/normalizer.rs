@@ -3,8 +3,9 @@
 //! This module provides the main Normalizer struct that orchestrates
 //! the text normalization pipeline.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use dashmap::DashMap;
 
 use crate::config::{Language, NormalizerConfig, Operator};
 use crate::contractions::fix_contractions;
@@ -14,25 +15,36 @@ use crate::token_parser::TokenParser;
 
 /// FST file cache for lazy loading
 struct FstCache {
-    fsts: HashMap<String, FstTextNormalizer>,
+    fsts: DashMap<String, FstTextNormalizer>,
     fst_dir: PathBuf,
 }
 
 impl FstCache {
     fn new<P: AsRef<Path>>(fst_dir: P) -> Self {
         Self {
-            fsts: HashMap::new(),
+            fsts: DashMap::new(),
             fst_dir: fst_dir.as_ref().to_path_buf(),
         }
     }
 
-    fn get_or_load(&mut self, relative_path: &str) -> Result<&FstTextNormalizer> {
-        if !self.fsts.contains_key(relative_path) {
+    fn get_or_load(&self, relative_path: &str) -> Result<()> {
+        use dashmap::mapref::entry::Entry;
+
+        let entry = self.fsts.entry(relative_path.to_string());
+        if let Entry::Vacant(e) = entry {
             let full_path = self.fst_dir.join(relative_path);
             let normalizer = FstTextNormalizer::from_file(&full_path)?;
-            self.fsts.insert(relative_path.to_string(), normalizer);
+            e.insert(normalizer);
         }
-        Ok(self.fsts.get(relative_path).unwrap())
+        Ok(())
+    }
+
+    fn get(&self, relative_path: &str) -> Result<dashmap::mapref::one::Ref<'_, String, FstTextNormalizer>> {
+        self.fsts
+            .get(relative_path)
+            .ok_or_else(|| {
+                crate::error::WeTextError::FstNotFound(relative_path.to_string())
+            })
     }
 }
 
@@ -47,7 +59,7 @@ impl FstCache {
 /// use wetext_rs::{Normalizer, NormalizerConfig, Language};
 ///
 /// let config = NormalizerConfig::new().with_lang(Language::Zh);
-/// let mut normalizer = Normalizer::new("path/to/fsts", config);
+/// let normalizer = Normalizer::new("path/to/fsts", config);
 /// let result = normalizer.normalize("2024年").unwrap();
 /// // Result: "二零二四年"
 /// ```
@@ -75,13 +87,13 @@ impl Normalizer {
     }
 
     /// Normalize text using the configured settings
-    pub fn normalize(&mut self, text: &str) -> Result<String> {
+    pub fn normalize(&self, text: &str) -> Result<String> {
         self.normalize_with_config(text, &self.config.clone())
     }
 
     /// Normalize text with a specific configuration
     pub fn normalize_with_config(
-        &mut self,
+        &self,
         text: &str,
         config: &NormalizerConfig,
     ) -> Result<String> {
@@ -198,46 +210,51 @@ impl Normalizer {
     }
 
     /// Preprocessing step
-    fn preprocess(&mut self, text: &str, config: &NormalizerConfig) -> Result<String> {
+    fn preprocess(&self, text: &str, config: &NormalizerConfig) -> Result<String> {
         let mut result = text.trim().to_string();
 
         if config.traditional_to_simple {
-            let fst = self.cache.get_or_load("traditional_to_simple.fst")?;
-            result = fst.normalize(&result)?;
+            self.cache.get_or_load("traditional_to_simple.fst")?;
+            let fst = self.cache.get("traditional_to_simple.fst")?;
+            result = fst.value().normalize(&result)?;
         }
 
         Ok(result)
     }
 
     /// Postprocessing step
-    fn postprocess(&mut self, text: &str, config: &NormalizerConfig) -> Result<String> {
+    fn postprocess(&self, text: &str, config: &NormalizerConfig) -> Result<String> {
         let mut result = text.to_string();
 
         if config.full_to_half {
-            let fst = self.cache.get_or_load("full_to_half.fst")?;
-            result = fst.normalize(&result)?;
+            self.cache.get_or_load("full_to_half.fst")?;
+            let fst = self.cache.get("full_to_half.fst")?;
+            result = fst.value().normalize(&result)?;
         }
 
         if config.remove_interjections {
-            let fst = self.cache.get_or_load("remove_interjections.fst")?;
-            result = fst.normalize(&result)?;
+            self.cache.get_or_load("remove_interjections.fst")?;
+            let fst = self.cache.get("remove_interjections.fst")?;
+            result = fst.value().normalize(&result)?;
         }
 
         if config.remove_puncts {
-            let fst = self.cache.get_or_load("remove_puncts.fst")?;
-            result = fst.normalize(&result)?;
+            self.cache.get_or_load("remove_puncts.fst")?;
+            let fst = self.cache.get("remove_puncts.fst")?;
+            result = fst.value().normalize(&result)?;
         }
 
         if config.tag_oov {
-            let fst = self.cache.get_or_load("tag_oov.fst")?;
-            result = fst.normalize(&result)?;
+            self.cache.get_or_load("tag_oov.fst")?;
+            let fst = self.cache.get("tag_oov.fst")?;
+            result = fst.value().normalize(&result)?;
         }
 
         Ok(result.trim().to_string())
     }
 
     /// Tag entities using tagger FST
-    fn tag(&mut self, text: &str, lang: Language, config: &NormalizerConfig) -> Result<String> {
+    fn tag(&self, text: &str, lang: Language, config: &NormalizerConfig) -> Result<String> {
         let fst_path = match (lang, config.operator) {
             (Language::En, Operator::Tn) => "en/tn/tagger.fst",
             (Language::Zh, Operator::Tn) => "zh/tn/tagger.fst",
@@ -259,8 +276,9 @@ impl Normalizer {
             _ => return Err(WeTextError::InvalidLanguage(format!("{:?}", lang))),
         };
 
-        let fst = self.cache.get_or_load(fst_path)?;
-        let result = fst.normalize(text)?;
+        self.cache.get_or_load(fst_path)?;
+        let fst = self.cache.get(fst_path)?;
+        let result = fst.value().normalize(text)?;
         Ok(result.trim().to_string())
     }
 
@@ -272,7 +290,7 @@ impl Normalizer {
 
     /// Verbalize using verbalizer FST
     fn verbalize(
-        &mut self,
+        &self,
         text: &str,
         lang: Language,
         config: &NormalizerConfig,
@@ -292,8 +310,9 @@ impl Normalizer {
             _ => return Err(WeTextError::InvalidLanguage(format!("{:?}", lang))),
         };
 
-        let fst = self.cache.get_or_load(fst_path)?;
-        let result = fst.normalize(text)?;
+        self.cache.get_or_load(fst_path)?;
+        let fst = self.cache.get(fst_path)?;
+        let result = fst.value().normalize(text)?;
         Ok(result.trim().to_string())
     }
 }

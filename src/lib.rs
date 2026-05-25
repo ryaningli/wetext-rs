@@ -16,7 +16,7 @@
 //! let config = NormalizerConfig::new()
 //!     .with_lang(Language::Zh);
 //!
-//! let mut normalizer = Normalizer::new("path/to/fsts", config);
+//! let normalizer = Normalizer::new("path/to/fsts", config);
 //! let result = normalizer.normalize("2024年1月15日").unwrap();
 //! println!("{}", result);  // 二零二四年一月十五日
 //! ```
@@ -47,6 +47,6 @@ pub use normalizer::Normalizer;
 /// assert_eq!(result, "一百二十三");
 /// ```
 pub fn normalize<P: AsRef<std::path::Path>>(fst_dir: P, text: &str) -> Result<String> {
-    let mut normalizer = Normalizer::with_defaults(fst_dir);
+    let normalizer = Normalizer::with_defaults(fst_dir);
     normalizer.normalize(text)
 }
